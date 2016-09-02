@@ -3,7 +3,7 @@ CFLAGS=-c -Wall -g
 LDFLAGS=-Llibrdmacm -libverbs -lpthread
 
 SOURCES=rc_pingpong.c pingpong.c
-OBJECTS=$(SOURCES:.cpp=.o)
+OBJECTS=$(SOURCES:.c=.o)
 
 EXECUTABLE=pp
 
