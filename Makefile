@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-c -Wall -g
+CFLAGS=-c -Wall -g -D_GNU_SOURCE
 LDFLAGS=-Llibrdmacm -libverbs -lpthread
 
 SOURCES=rc_pingpong.c pingpong.c
