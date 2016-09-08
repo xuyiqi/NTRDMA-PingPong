@@ -631,6 +631,7 @@ static void usage(const char *argv0)
 	printf("  %s <host>     connect to server at <host>\n", argv0);
 	printf("\n");
 	printf("Options:\n");
+	printf("  -b, --server=<server>  connect to the server <server>\n");
 	printf("  -p, --port=<port>      listen on/connect to port <port> (default 18515)\n");
 	printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
 	printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
