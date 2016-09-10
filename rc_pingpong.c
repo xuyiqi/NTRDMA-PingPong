@@ -47,6 +47,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <pthread.h>
+#include <assert.h>
 #include "pingpong.h"
 
 enum {
@@ -54,6 +55,7 @@ enum {
 	PINGPONG_SEND_WRID = 2,
 };
 int random_value = 0;
+int one_buf = 0;
 struct pingpong_context {
 	struct ibv_context	*context;
 	struct ibv_comp_channel *channel;
@@ -66,6 +68,9 @@ struct pingpong_context {
 	int			 rx_depth;
 	int			 pending;
 	struct ibv_port_attr     portinfo;
+        struct ibv_mr          **mrs;
+        void                   **bufs;
+        int                      counter;
 };
 
 static int page_size;
@@ -457,13 +462,24 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	ctx->size     = size;
 	ctx->rx_depth = rx_depth;
 	fprintf(stdout, "mallocing ctx buf\n");
-	ctx->buf = malloc(roundup(size, page_size));
-	if (!ctx->buf) {
-		fprintf(stderr, "Couldn't allocate work buf.\n");
-		return NULL;
-	}
+        if (one_buf) {
+                //ctx->buf = malloc(roundup(size, page_size));
+                int error = posix_memalign(&ctx->buf, page_size, size);
+                if (!ctx->buf || !error) {
+                        fprintf(stderr, "Couldn't allocate work buf.\n");
+                        return NULL;
+                }
 
-	memset(ctx->buf, 0x7b + is_server, size);
+                memset(ctx->buf, 0x7b + is_server, size);
+        } else {
+                fprintf(stderr, "mallocing ctx buf\n");
+                ctx->bufs = calloc(rx_depth + 1, sizeof(void *));
+                if (!ctx->bufs) {
+                        fprintf(stderr, "Couldn't allocate work multi buf.\n");
+                        return NULL;
+                }
+        }
+
 	fprintf(stdout, "opening dev\n");
 	ctx->context = ibv_open_device(ib_dev);
 	if (!ctx->context) {
@@ -471,6 +487,42 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 			ibv_get_device_name(ib_dev));
 		return NULL;
 	}
+
+
+        struct ibv_device_attr device_attr;
+        memset(&device_attr, 0, sizeof(device_attr));
+        if(ibv_query_device(ctx->context, &device_attr)) {
+                printf("Could not query device\n");
+                return NULL;
+        }
+
+
+        struct ibv_port_attr port_attr;
+        if(ibv_query_port(ctx->context, port, &port_attr) != 0) {
+                printf("HRD: Could not query port %d of device\n", port);
+                return NULL;
+        }
+        if(port_attr.phys_state != IBV_PORT_ACTIVE &&
+          port_attr.phys_state != IBV_PORT_ACTIVE_DEFER) {
+#ifndef __cplusplus
+                printf("Ignoring port %d of device. State is %s, value %i\n",
+                       port, ibv_port_state_str(port_attr.phys_state), port_attr.phys_state);
+#else
+                printf("Ignoring port %d of device. State is %s, value %i\n",
+                       port,
+                       ibv_port_state_str((ibv_port_state) port_attr.phys_state), port_attr.phys_state) ;
+#endif
+        } else {
+#ifndef __cplusplus
+                printf("Port %d of device. State is %s\n",
+                       port, ibv_port_state_str(port_attr.phys_state));
+#else
+                printf("Port %d of device. State is %s\n",
+                       port,
+                       ibv_port_state_str((ibv_port_state) port_attr.phys_state));
+#endif
+        }
+
 	fprintf(stdout, "creating cmp channel\n");
 	if (use_event) {
 		ctx->channel = ibv_create_comp_channel(ctx->context);
@@ -487,11 +539,20 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		return NULL;
 	}
 	fprintf(stdout, "reging mr\n");
-	ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size, IBV_ACCESS_LOCAL_WRITE);
-	if (!ctx->mr) {
-		fprintf(stderr, "Couldn't register MR\n");
-		return NULL;
-	}
+        if (one_buf) {
+                ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size, IBV_ACCESS_LOCAL_WRITE);
+                if (!ctx->mr) {
+                        fprintf(stderr, "Couldn't register MR\n");
+                        return NULL;
+                }
+        } else {
+                ctx->mrs = calloc(rx_depth + 1, sizeof(struct ibv_mr*));
+                if (!ctx->mrs) {
+                        fprintf(stderr, "Couldn't register multi MR\n");
+                        return NULL;
+                }
+        }
+
 	fprintf(stdout, "creating cq\n");
 	ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
 				ctx->channel, 0);
@@ -553,12 +614,27 @@ int pp_close_ctx(struct pingpong_context *ctx)
 		return 1;
 	}
 
-        fprintf(stderr, "Deregistering ctx 0x%p -> mr 0x%p\n", ctx, ctx->mr);
+        if (one_buf)
+                fprintf(stderr, "Deregistering ctx 0x%p -> mr 0x%p\n", ctx, ctx->mr);
 
-	if (ibv_dereg_mr(ctx->mr)) {
+	if (ctx->mr && ibv_dereg_mr(ctx->mr)) {
 		fprintf(stderr, "Couldn't deregister MR\n");
 		return 1;
 	}
+
+        if (ctx->mrs) {
+                for (int i = 0; i < rx_depth + 1; i++) {
+                        if (ctx->mrs[i])
+                                if (ibv_dereg_mr(ctx->mrs[i]))
+                                        fprintf(stderr, "dereging mrs error %i\n",i);
+                }
+        }
+
+        if (ctx->bufs) {
+                for (int i = 0; i < rx_depth + 1; i++) {
+                        if (ctx->bufs[i]) free(ctx->bufs[i]);
+                }
+        }
 
 	if (ibv_dealloc_pd(ctx->pd)) {
 		fprintf(stderr, "Couldn't deallocate PD\n");
@@ -577,7 +653,7 @@ int pp_close_ctx(struct pingpong_context *ctx)
 		return 1;
 	}
 
-	free(ctx->buf);
+	if (ctx->buf) free(ctx->buf);
 	free(ctx);
 
 	return 0;
@@ -585,52 +661,110 @@ int pp_close_ctx(struct pingpong_context *ctx)
 
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
-	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
-		.length = ctx->size,
-		.lkey	= ctx->mr->lkey
-	};
-	struct ibv_recv_wr wr = {
-		.wr_id	    = PINGPONG_RECV_WRID,
-		.sg_list    = &list,
-		.num_sge    = 1,
-	};
-	struct ibv_recv_wr *bad_wr;
-	int i;
+        int i;
+        if (one_buf) {
+                struct ibv_sge list = {
+                        .addr	= (uintptr_t) ctx->buf,
+                        .length = ctx->size,
+                        .lkey	= ctx->mr->lkey
+                };
+                struct ibv_recv_wr wr = {
+                        .wr_id	    = PINGPONG_RECV_WRID,
+                        .sg_list    = &list,
+                        .num_sge    = 1,
+                };
+                struct ibv_recv_wr *bad_wr;
 
-	for (i = 0; i < n; ++i)
-		if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
-			break;
+                for (i = 0; i < n; ++i)
+                        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
+                                break;
+        } else {
+                for (i = 0; i < n; ++i) {
+                        uint64_t nextID = ctx->counter++;
+                        uint64_t nextInd = nextID % (rx_depth + 1);
+                        //ctx->bufs[nextInd] = malloc(roundup(ctx->size, page_size));
+                        int error = posix_memalign(&ctx->bufs[nextInd], page_size, ctx->size);
+                        assert (ctx->bufs[nextInd] != NULL && "malloc recv buf failed");
+                        memset(ctx->bufs[nextInd], 0x7b + !servername, ctx->size);
+                        ctx->mrs[nextInd] = ibv_reg_mr(ctx->pd, ctx->bufs[nextInd], ctx->size, IBV_ACCESS_LOCAL_WRITE);
+                        assert(ctx->mrs[nextInd] != NULL && !error && "mr recv reg failed");
+                        struct ibv_sge list = {
+                                .addr	= (uintptr_t) ctx->bufs[nextInd],
+                                .length = ctx->size,
+                                .lkey	= ctx->mrs[nextInd]->lkey
+                        };
+                        struct ibv_recv_wr wr = {
+                                .wr_id	    = PINGPONG_RECV_WRID + (nextID << 2),
+                                .sg_list    = &list,
+                                .num_sge    = 1,
+                        };
+                        struct ibv_recv_wr *bad_wr;
+                        if (ibv_post_recv(ctx->qp, &wr, &bad_wr)) {
+                                fprintf(stderr, "post_recv many bufs failed at %i\n", i);
+                                break;
+                        }
+                }
 
+
+        }
 	return i;
 }
 
 static int pp_post_send(struct pingpong_context *ctx)
 {
-	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
-		.length = ctx->size,
-		.lkey	= ctx->mr->lkey
-	};
-	struct ibv_send_wr wr = {
-		.wr_id	    = PINGPONG_SEND_WRID,
-		.sg_list    = &list,
-		.num_sge    = 1,
-		.opcode     = IBV_WR_SEND,
-		.send_flags = IBV_SEND_SIGNALED,
-	};
-	struct ibv_send_wr *bad_wr;
+        if (one_buf) {
+                struct ibv_sge list = {
+                        .addr	= (uintptr_t) ctx->buf,
+                        .length = ctx->size,
+                        .lkey	= ctx->mr->lkey
+                };
+                struct ibv_send_wr wr = {
+                        .wr_id	    = PINGPONG_SEND_WRID,
+                        .sg_list    = &list,
+                        .num_sge    = 1,
+                        .opcode     = IBV_WR_SEND,
+                        .send_flags = IBV_SEND_SIGNALED,
+                };
+                struct ibv_send_wr *bad_wr;
+                return ibv_post_send(ctx->qp, &wr, &bad_wr);
+        } else {
+                uint64_t nextID = ctx->counter++;
+                uint64_t nextInd = nextID % (rx_depth + 1);
+                //ctx->bufs[nextInd] = malloc(roundup(ctx->size, page_size));
+                int error = posix_memalign( &ctx->bufs[nextInd], page_size, ctx->size);
+                assert(ctx->bufs[nextInd] != NULL && !error && "malloc send buf failed");
+                memset(ctx->bufs[nextInd], 0x7b + !servername, ctx->size);
+                ctx->mrs[nextInd] = ibv_reg_mr(ctx->pd, ctx->bufs[nextInd], ctx->size, IBV_ACCESS_LOCAL_WRITE);
+                assert(ctx->mrs[nextInd] != NULL && "mr send reg failed");
 
-	return ibv_post_send(ctx->qp, &wr, &bad_wr);
+
+                struct ibv_sge list = {
+                        .addr   = (uintptr_t) ctx->bufs[nextInd],
+                        .length = ctx->size,
+                        .lkey   = ctx->mrs[nextInd]->lkey
+                };
+                struct ibv_send_wr wr = {
+                        .wr_id      = PINGPONG_SEND_WRID + (nextID << 2),
+                        .sg_list    = &list,
+                        .num_sge    = 1,
+                        .opcode     = IBV_WR_SEND,
+                        .send_flags = IBV_SEND_SIGNALED,
+                };
+                struct ibv_send_wr *bad_wr;
+
+                return ibv_post_send(ctx->qp, &wr, &bad_wr);
+
+        }
 }
 
 static void usage(const char *argv0)
 {
 	printf("Usage:\n");
 	printf("  %s            start a server and wait for connection\n", argv0);
-	printf("  %s <host>     connect to server at <host>\n", argv0);
+	printf("  %s -b <host>     connect to server at <host>\n", argv0);
 	printf("\n");
 	printf("Options:\n");
+        printf("  -o, --sbuffer          use a single buffer on each connection\n");
 	printf("  -b, --server=<server>  connect to the server <server>\n");
 	printf("  -p, --port=<port>      listen on/connect to port <port> (default 18515)\n");
 	printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
@@ -666,14 +800,19 @@ int main(int argc, char *argv[])
 			{ .name = "events",   .has_arg = 0, .val = 'e' },
 			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
 			{ .name = "random",   .has_arg = 0, .val = 'a' },
+                        { .name = "sbuffer",  .has_arg = 0, .val = 'o' },
 			{ 0 }
 		};
 
-		c = getopt_long(argc, argv, "b:p:d:i:s:m:r:n:l:eag:", long_options, NULL);
+		c = getopt_long(argc, argv, "b:p:d:i:s:m:r:n:l:eaog:", long_options, NULL);
 		if (c == -1)
 			break;
 
 		switch (c) {
+                case 'o':
+                        one_buf = 1;
+                        fprintf(stderr, "using one buffer\n");
+                        break;
                 case 'a':
 
 			random_value = lrand48() & 0xffffff;
@@ -737,7 +876,7 @@ int main(int argc, char *argv[])
                 default:
                         fprintf(stderr, "incorrect option %c\n", c);
 			usage(argv[0]);
-                          /*return 1;*/
+                        return 1;
 		}
 	}
 
@@ -894,6 +1033,7 @@ intptr_t flow_control (void * arg)
 	int scnt = 0;
 	int num_cq_events = 0;
 	fprintf(stdout, "new enter\n");
+        int error = 0;
 	while (rcnt < iters || scnt < iters) {
 		fprintf(stderr,"entering with send %d, recv %d\n", scnt, rcnt);
 		if (use_event) {
@@ -927,21 +1067,39 @@ intptr_t flow_control (void * arg)
 				ne = ibv_poll_cq(ctx->cq, 2, wc);
 				if (ne < 0) {
 					fprintf(stderr, "poll CQ failed %d\n", ne);
-					return 1;
+					error = 1;
+                                        goto exit;
 				}
 
 			} while (!use_event && ne < 1);
 			fprintf(stderr,"polled %d, send %d, recv %d\n", ne, scnt, rcnt);
+
+
 			for (i = 0; i < ne; ++i) {
+                                int read_write_id = 0x3 & wc[i].wr_id;
+                                uint64_t wr_id = wc[i].wr_id >> 2;
+
 				if (wc[i].status != IBV_WC_SUCCESS) {
 					fprintf(stderr, "Failed status %s (0x%x) for wr_id %d, syndrome 0x%x\n",
 						ibv_wc_status_str(wc[i].status),
-						wc[i].status, (int) wc[i].wr_id,
+						wc[i].status, (int) wr_id,
                                                 wc[i].vendor_err);
-					return 1;
+                                        error = 1;
+					goto exit;
 				}
+                                int wr_id_index = wr_id % (rx_depth + 1);
+                                if (!one_buf) {
+                                        assert(ctx->bufs[wr_id_index] != NULL);
+                                        free(ctx->bufs[wr_id_index]);
+                                        ctx->bufs[wr_id_index] = NULL;
+                                        //free buffer
+                                        assert(ctx->mrs[wr_id_index] != NULL);
+                                        assert(ibv_dereg_mr(ctx->mrs[wr_id_index]) == 0 && "dereg mr failed");
+                                        ctx->mrs[wr_id_index] = NULL;
+                                        //dereg mr void
+                                }
 
-				switch ((int) wc[i].wr_id) {
+				switch ((int) read_write_id) {
 				case PINGPONG_SEND_WRID:
 					++scnt;
 					break;
@@ -953,7 +1111,8 @@ intptr_t flow_control (void * arg)
 							fprintf(stderr,
 								"Couldn't post receive (%d)\n",
 								routs);
-							return 1;
+                                                        error = 1;
+							goto exit;
 						}
 					}
 
@@ -962,11 +1121,12 @@ intptr_t flow_control (void * arg)
 
 				default:
 					fprintf(stderr, "Completion for unknown wr_id %d\n",
-						(int) wc[i].wr_id);
-					return 1;
+						(int) read_write_id);
+                                        error = 1;
+					goto exit;
 				}
 
-				ctx->pending &= ~(int) wc[i].wr_id;
+				ctx->pending &= ~(int) read_write_id;
 				if (scnt < iters && !ctx->pending) {
 					if (pp_post_send(ctx)) {
 						fprintf(stderr, "Couldn't post send\n");
@@ -994,7 +1154,7 @@ intptr_t flow_control (void * arg)
 		printf("%d iters in %.2f seconds = %.2f usec/iter\n",
 		       iters, usec / 1000000., usec / iters);
 	}
-
+exit:
 	ibv_ack_cq_events(ctx->cq, num_cq_events);
 
 	if (pp_close_ctx(ctx))
@@ -1003,5 +1163,5 @@ intptr_t flow_control (void * arg)
 	ibv_free_device_list(dev_list);
 	free(rem_dest);
 
-	return 0;
+	return error;
 }
