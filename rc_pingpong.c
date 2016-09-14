@@ -56,6 +56,8 @@ enum {
 };
 int random_value = 0;
 int one_buf = 0;
+int reuse_multi_buf = 0;
+
 struct pingpong_context {
 	struct ibv_context	*context;
 	struct ibv_comp_channel *channel;
@@ -71,6 +73,8 @@ struct pingpong_context {
         struct ibv_mr          **mrs;
         void                   **bufs;
         int                      counter;
+        int                      lastUsedMR;
+        int                     *bufUsage;
 };
 
 static int page_size;
@@ -311,8 +315,8 @@ static void* pp_server_exch_dest(void * arg) {
 	}
 	while (1) {
 	connfd = accept(sockfd, NULL, 0);
-	
-	if (connfd < 0) {
+
+        if (connfd < 0) {
 		fprintf(stderr, "accept() failed\n");
 		return NULL;
 	}
@@ -393,7 +397,7 @@ static void* pp_server_exch_dest(void * arg) {
                 memset(&my_dest->gid, 0, sizeof my_dest->gid);
 
         my_dest->qpn = ctx->qp->qp_num;
-        my_dest->psn = lrand48() & 0xffffff;
+        my_dest->psn = random_value? lrand48() & 0xffffff : 0;
 	fprintf(stdout, "connecting to qp\n");
 
         if (pp_connect_ctx(ctx, ib_port, my_dest->psn, mtu, sl, rem_dest, gidx)) {
@@ -458,15 +462,16 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	ctx = calloc(1, sizeof *ctx);
 	if (!ctx)
 		return NULL;
-
+        ctx->lastUsedMR = -1;
 	ctx->size     = size;
 	ctx->rx_depth = rx_depth;
 	fprintf(stdout, "mallocing ctx buf\n");
         if (one_buf) {
                 //ctx->buf = malloc(roundup(size, page_size));
                 int error = posix_memalign(&ctx->buf, page_size, size);
-                if (!ctx->buf || !error) {
+                if (!ctx->buf || error) {
                         fprintf(stderr, "Couldn't allocate work buf.\n");
+                        perror("");
                         return NULL;
                 }
 
@@ -474,8 +479,10 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
         } else {
                 fprintf(stderr, "mallocing ctx buf\n");
                 ctx->bufs = calloc(rx_depth + 1, sizeof(void *));
+                ctx->bufUsage = calloc(rx_depth + 1, sizeof (int));
                 if (!ctx->bufs) {
                         fprintf(stderr, "Couldn't allocate work multi buf.\n");
+                        perror("");
                         return NULL;
                 }
         }
@@ -659,6 +666,35 @@ int pp_close_ctx(struct pingpong_context *ctx)
 	return 0;
 }
 
+int find_free_mr_bitmap(struct pingpong_context *ctx) {
+        int start = ctx->lastUsedMR + 1;
+        int i = 0;
+        while (i++ < rx_depth + 1) {
+                start = start % (rx_depth + 1);
+                if (ctx->bufUsage[start] == 0) {
+                        ctx->lastUsedMR = start;
+                        return start;
+                }
+                start++;
+        }
+        return -1;
+
+}
+
+int find_free_mr(struct pingpong_context *ctx) {
+        int start = ctx->lastUsedMR + 1;
+        int i = 0;
+        while (i++ < rx_depth + 1) {
+                start = start % (rx_depth + 1);
+                if (ctx->bufs[start] == NULL) {
+                        ctx->lastUsedMR = start;
+                        return start;
+                }
+                start++;
+        }
+        return -1;
+}
+
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
         int i;
@@ -681,20 +717,26 @@ static int pp_post_recv(struct pingpong_context *ctx, int n)
         } else {
                 for (i = 0; i < n; ++i) {
                         uint64_t nextID = ctx->counter++;
-                        uint64_t nextInd = nextID % (rx_depth + 1);
+                        uint64_t nextInd = reuse_multi_buf ? find_free_mr_bitmap(ctx) : find_free_mr(ctx);
+                        assert(nextInd >=0 && "Couldn't find free buffer to use");
                         //ctx->bufs[nextInd] = malloc(roundup(ctx->size, page_size));
-                        int error = posix_memalign(&ctx->bufs[nextInd], page_size, ctx->size);
-                        assert (ctx->bufs[nextInd] != NULL && "malloc recv buf failed");
-                        memset(ctx->bufs[nextInd], 0x7b + !servername, ctx->size);
-                        ctx->mrs[nextInd] = ibv_reg_mr(ctx->pd, ctx->bufs[nextInd], ctx->size, IBV_ACCESS_LOCAL_WRITE);
-                        assert(ctx->mrs[nextInd] != NULL && !error && "mr recv reg failed");
+                        if (!reuse_multi_buf || nextID < rx_depth + 1) {
+                                assert(ctx->bufs[nextInd] == NULL && "Found free buffer but not actually free");
+                                int error = posix_memalign(&ctx->bufs[nextInd], page_size, ctx->size);
+                                assert (ctx->bufs[nextInd] != NULL && "malloc recv buf failed");
+                                memset(ctx->bufs[nextInd], 0x7b + !servername, ctx->size);
+                                assert(ctx->mrs[nextInd] == NULL);
+                                ctx->mrs[nextInd] = ibv_reg_mr(ctx->pd, ctx->bufs[nextInd], ctx->size, IBV_ACCESS_LOCAL_WRITE);
+                                assert(ctx->mrs[nextInd] != NULL && !error && "mr recv reg failed");
+                        }
+                        ctx->bufUsage[nextInd] = 1;
                         struct ibv_sge list = {
                                 .addr	= (uintptr_t) ctx->bufs[nextInd],
                                 .length = ctx->size,
                                 .lkey	= ctx->mrs[nextInd]->lkey
                         };
                         struct ibv_recv_wr wr = {
-                                .wr_id	    = PINGPONG_RECV_WRID + (nextID << 2),
+                                .wr_id	    = PINGPONG_RECV_WRID + (nextID << 12) + (nextInd << 2),
                                 .sg_list    = &list,
                                 .num_sge    = 1,
                         };
@@ -729,12 +771,16 @@ static int pp_post_send(struct pingpong_context *ctx)
                 return ibv_post_send(ctx->qp, &wr, &bad_wr);
         } else {
                 uint64_t nextID = ctx->counter++;
-                uint64_t nextInd = nextID % (rx_depth + 1);
+                uint64_t nextInd = reuse_multi_buf ? find_free_mr_bitmap(ctx) : find_free_mr(ctx);
                 //ctx->bufs[nextInd] = malloc(roundup(ctx->size, page_size));
-                int error = posix_memalign( &ctx->bufs[nextInd], page_size, ctx->size);
-                assert(ctx->bufs[nextInd] != NULL && !error && "malloc send buf failed");
-                memset(ctx->bufs[nextInd], 0x7b + !servername, ctx->size);
-                ctx->mrs[nextInd] = ibv_reg_mr(ctx->pd, ctx->bufs[nextInd], ctx->size, IBV_ACCESS_LOCAL_WRITE);
+                if (!reuse_multi_buf || nextID < rx_depth + 1) {
+                        int error = posix_memalign( &ctx->bufs[nextInd], page_size, ctx->size);
+                        assert(ctx->bufs[nextInd] != NULL && !error && "malloc send buf failed");
+                        memset(ctx->bufs[nextInd], 0x7b + !servername, ctx->size);
+                        assert(ctx->mrs[nextInd] == NULL);
+                        ctx->mrs[nextInd] = ibv_reg_mr(ctx->pd, ctx->bufs[nextInd], ctx->size, IBV_ACCESS_LOCAL_WRITE);
+                }
+                ctx->bufUsage[nextInd] = 1;
                 assert(ctx->mrs[nextInd] != NULL && "mr send reg failed");
 
 
@@ -744,7 +790,7 @@ static int pp_post_send(struct pingpong_context *ctx)
                         .lkey   = ctx->mrs[nextInd]->lkey
                 };
                 struct ibv_send_wr wr = {
-                        .wr_id      = PINGPONG_SEND_WRID + (nextID << 2),
+                        .wr_id      = PINGPONG_SEND_WRID + (nextID << 12) + (nextInd << 2),
                         .sg_list    = &list,
                         .num_sge    = 1,
                         .opcode     = IBV_WR_SEND,
@@ -760,23 +806,24 @@ static int pp_post_send(struct pingpong_context *ctx)
 static void usage(const char *argv0)
 {
 	printf("Usage:\n");
-	printf("  %s            start a server and wait for connection\n", argv0);
-	printf("  %s -b <host>     connect to server at <host>\n", argv0);
+	printf("  %s                          start a server and wait for connection\n", argv0);
+	printf("  %s -b <host>                connect to server at <host>\n", argv0);
 	printf("\n");
 	printf("Options:\n");
-        printf("  -o, --sbuffer          use a single buffer on each connection\n");
-	printf("  -b, --server=<server>  connect to the server <server>\n");
-	printf("  -p, --port=<port>      listen on/connect to port <port> (default 18515)\n");
-	printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
-	printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
-	printf("  -s, --size=<size>      size of message to exchange (default 4096)\n");
-	printf("  -m, --mtu=<size>       path MTU (default 1024)\n");
-	printf("  -r, --rx-depth=<dep>   number of receives to post at a time (default 500)\n");
-	printf("  -n, --iters=<iters>    number of exchanges (default 1000)\n");
-	printf("  -l, --sl=<sl>          service level value\n");
-	printf("  -e, --events           sleep on CQ events (default poll)\n");
-	printf("  -a, --random           use random value for PSN when connecting (default 0)\n");
-	printf("  -g, --gid-idx=<gid index> local port gid index\n");
+        printf("  -u, --reuse-buffer          in multiple buffer mode, allocate only once\n");
+        printf("  -o, --sbuffer               use a single buffer on each connection\n");
+	printf("  -b, --server=<server>       connect to the server <server>\n");
+	printf("  -p, --port=<port>           listen on/connect to port <port> (default 18515)\n");
+	printf("  -d, --ib-dev=<dev>          use IB device <dev> (default first device found)\n");
+	printf("  -i, --ib-port=<port>        use port <port> of IB device (default 1)\n");
+	printf("  -s, --size=<size>           size of message to exchange (default 4096)\n");
+	printf("  -m, --mtu=<size>            path MTU (default 1024)\n");
+	printf("  -r, --rx-depth=<dep>        number of receives to post at a time (default 500)\n");
+	printf("  -n, --iters=<iters>         number of exchanges (default 1000)\n");
+	printf("  -l, --sl=<sl>               service level value\n");
+	printf("  -e, --events                sleep on CQ events (default poll)\n");
+	printf("  -a, --random                use random value for PSN when connecting (default 0)\n");
+	printf("  -g, --gid-idx=<gid index>   local port gid index\n");
 }
 intptr_t init();
 int main(int argc, char *argv[])
@@ -788,34 +835,37 @@ int main(int argc, char *argv[])
 		int c;
 
 		static struct option long_options[] = {
-                        { .name = "server",   .has_arg = 1, .val = 'b'},
-			{ .name = "port",     .has_arg = 1, .val = 'p' },
-			{ .name = "ib-dev",   .has_arg = 1, .val = 'd' },
-			{ .name = "ib-port",  .has_arg = 1, .val = 'i' },
-			{ .name = "size",     .has_arg = 1, .val = 's' },
-			{ .name = "mtu",      .has_arg = 1, .val = 'm' },
-			{ .name = "rx-depth", .has_arg = 1, .val = 'r' },
-			{ .name = "iters",    .has_arg = 1, .val = 'n' },
-			{ .name = "sl",       .has_arg = 1, .val = 'l' },
-			{ .name = "events",   .has_arg = 0, .val = 'e' },
-			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
-			{ .name = "random",   .has_arg = 0, .val = 'a' },
-                        { .name = "sbuffer",  .has_arg = 0, .val = 'o' },
+                        { .name = "server",       .has_arg = 1, .val = 'b'},
+			{ .name = "port",         .has_arg = 1, .val = 'p' },
+			{ .name = "ib-dev",       .has_arg = 1, .val = 'd' },
+			{ .name = "ib-port",      .has_arg = 1, .val = 'i' },
+			{ .name = "size",         .has_arg = 1, .val = 's' },
+			{ .name = "mtu",          .has_arg = 1, .val = 'm' },
+			{ .name = "rx-depth",     .has_arg = 1, .val = 'r' },
+			{ .name = "iters",        .has_arg = 1, .val = 'n' },
+			{ .name = "sl",           .has_arg = 1, .val = 'l' },
+			{ .name = "events",       .has_arg = 0, .val = 'e' },
+			{ .name = "gid-idx",      .has_arg = 1, .val = 'g' },
+			{ .name = "random",       .has_arg = 0, .val = 'a' },
+                        { .name = "sbuffer",      .has_arg = 0, .val = 'o' },
+                        { .name = "reuse-buffer", .has_arg = 0, .val = 'u' },
 			{ 0 }
 		};
 
-		c = getopt_long(argc, argv, "b:p:d:i:s:m:r:n:l:eaog:", long_options, NULL);
+		c = getopt_long(argc, argv, "b:p:d:i:s:m:r:n:l:eaoug:", long_options, NULL);
 		if (c == -1)
 			break;
 
 		switch (c) {
+                case 'u':
+                        reuse_multi_buf = 1;
+                        break;
                 case 'o':
                         one_buf = 1;
-                        fprintf(stderr, "using one buffer\n");
                         break;
                 case 'a':
 
-			random_value = lrand48() & 0xffffff;
+			random_value = 1;
 			break;
 		case 'p':
 			port = strtol(optarg, NULL, 0);
@@ -981,7 +1031,7 @@ intptr_t init() {
 		memset(&my_dest->gid, 0, sizeof my_dest->gid);
 
 	my_dest->qpn = ctx->qp->qp_num;
-	my_dest->psn = random_value & 0xffffff;
+	my_dest->psn = random_value ? lrand48() & 0xffffff : 0;
 
 
 	inet_ntop(AF_INET6, &my_dest->gid, gid, sizeof gid);
@@ -1061,7 +1111,7 @@ intptr_t flow_control (void * arg)
 		{
 			struct ibv_wc wc[2];
 			int ne, i;
-			fprintf(stdout, "polling\n");
+			fprintf(stderr, "polling\n");
 			do {
 				//fprintf(stderr, "polling %d\n", p++);
 				ne = ibv_poll_cq(ctx->cq, 2, wc);
@@ -1077,8 +1127,9 @@ intptr_t flow_control (void * arg)
 
 			for (i = 0; i < ne; ++i) {
                                 int read_write_id = 0x3 & wc[i].wr_id;
-                                uint64_t wr_id = wc[i].wr_id >> 2;
-
+                                uint64_t wr_id = wc[i].wr_id >> 12 ;
+                                int wr_id_index = (wc[i].wr_id & 0xfff) >> 2;
+                                // [nextID=20-52][indexinbuffer=10][w/r=2]
 				if (wc[i].status != IBV_WC_SUCCESS) {
 					fprintf(stderr, "Failed status %s (0x%x) for wr_id %d, syndrome 0x%x\n",
 						ibv_wc_status_str(wc[i].status),
@@ -1087,16 +1138,18 @@ intptr_t flow_control (void * arg)
                                         error = 1;
 					goto exit;
 				}
-                                int wr_id_index = wr_id % (rx_depth + 1);
                                 if (!one_buf) {
-                                        assert(ctx->bufs[wr_id_index] != NULL);
-                                        free(ctx->bufs[wr_id_index]);
-                                        ctx->bufs[wr_id_index] = NULL;
-                                        //free buffer
-                                        assert(ctx->mrs[wr_id_index] != NULL);
-                                        assert(ibv_dereg_mr(ctx->mrs[wr_id_index]) == 0 && "dereg mr failed");
-                                        ctx->mrs[wr_id_index] = NULL;
-                                        //dereg mr void
+                                        if (!reuse_multi_buf) {
+                                                assert(ctx->bufs[wr_id_index] != NULL);
+                                                free(ctx->bufs[wr_id_index]);
+                                                ctx->bufs[wr_id_index] = NULL;
+                                                assert(ctx->mrs[wr_id_index] != NULL);
+                                                assert(ibv_dereg_mr(ctx->mrs[wr_id_index]) == 0 && "dereg mr failed");
+                                                fprintf(stderr, "setting mr %i  to NULL\n", wr_id_index);
+                                                ctx->mrs[wr_id_index] = NULL;
+                                                assert(ctx->mrs[wr_id_index] == NULL);
+                                        }
+                                        ctx->bufUsage[wr_id_index] = 0;
                                 }
 
 				switch ((int) read_write_id) {
